@@ -1,8 +1,12 @@
 fastapi==0.110.0
 uvicorn[standard]==0.27.1
 
+spacy==3.7.5
+en-core-web-sm==3.7.1
+
+openai-whisper==20231117
+
 numpy==1.26.4
-spacy==3.7.4
 tqdm==4.66.4
 regex==2024.11.6
 requests==2.32.3
