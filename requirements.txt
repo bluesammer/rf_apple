@@ -9,7 +9,5 @@ requests==2.32.3
 
 pydantic==2.6.4
 
-openai-whisper==20231117
-
 torch==2.1.2+cpu
 --extra-index-url https://download.pytorch.org/whl/cpu
