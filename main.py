@@ -19,35 +19,18 @@ import re
 import urllib.request
 import uuid
 import threading
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict
 
 import whisper
 import spacy
-import stripe
-import psycopg2
-from psycopg2.extras import RealDictCursor
 
-from fastapi import FastAPI, HTTPException, Request, Header
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
 
-# -------------------- CONFIG --------------------
-
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
-SUCCESS_URL = os.getenv("SUCCESS_URL", "").strip()
-CANCEL_URL = os.getenv("CANCEL_URL", "").strip()
-
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
-
-PRICE_ID_10_CREDITS = os.getenv("PRICE_ID_10_CREDITS", "").strip()
-
-CREDITS_PER_PROCESS = 1
-
-# ---------- TUNING (change these only) ----------
+# ---------- TUNING ----------
 PLAY_RES_X = 1080
 PLAY_RES_Y = 1920
 
@@ -57,12 +40,11 @@ WORD_X = 250
 
 FONT_SIZE = 45
 OUTLINE = 5
-LINE_GAP = 8
 
 LOGO_SCALE_W = 160
 LOGO_PAD_X = 30
 LOGO_PAD_Y = 30
-# ----------------------------------------------
+# --------------------------
 
 app = FastAPI()
 
@@ -71,91 +53,11 @@ _whisper_model = None
 TRANSCRIBE_LOCK = threading.Lock()
 PROCESS_LOCK = threading.Lock()
 
-if STRIPE_SECRET_KEY:
-    stripe.api_key = STRIPE_SECRET_KEY
-
-
-# -------------------- DB --------------------
-
-def db_conn():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL missing")
-    return psycopg2.connect(DATABASE_URL)
-
-def db_init():
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-              email TEXT PRIMARY KEY,
-              credits INTEGER NOT NULL DEFAULT 0,
-              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-            """)
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS stripe_events (
-              event_id TEXT PRIMARY KEY,
-              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-            """)
-            conn.commit()
-
-def ensure_user(email: str):
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO users(email, credits) VALUES (%s, 0) ON CONFLICT (email) DO NOTHING;", (email,))
-            conn.commit()
-
-def get_credits(email: str) -> int:
-    ensure_user(email)
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT credits FROM users WHERE email=%s;", (email,))
-            row = cur.fetchone()
-            return int(row[0]) if row else 0
-
-def add_credits(email: str, delta: int):
-    ensure_user(email)
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("UPDATE users SET credits = GREATEST(credits + %s, 0) WHERE email=%s;", (delta, email))
-            conn.commit()
-
-def try_consume_credits(email: str, cost: int) -> bool:
-    ensure_user(email)
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-            UPDATE users
-               SET credits = credits - %s
-             WHERE email = %s
-               AND credits >= %s
-            RETURNING credits;
-            """, (cost, email, cost))
-            ok = cur.fetchone() is not None
-            conn.commit()
-            return ok
-
-def mark_event_once(event_id: str) -> bool:
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM stripe_events WHERE event_id=%s;", (event_id,))
-            if cur.fetchone():
-                return False
-            cur.execute("INSERT INTO stripe_events(event_id) VALUES (%s);", (event_id,))
-            conn.commit()
-            return True
-
 
 # -------------------- MODELS --------------------
 
-class CreateCheckoutReq(BaseModel):
-    email: str = Field(..., description="User email")
-    credits_pack: str = Field("10", description="Only '10' supported for v1")
-
 class ProcessReq(BaseModel):
-    email: str = Field(..., description="User email, used for credits")
-    video_url: str = Field(..., description="Direct public mp4 url")
+    video_url: str = Field(..., description="Direct public or signed mp4/mov url")
 
     slots: int = 5
     target_fps: int = 30
@@ -173,8 +75,6 @@ class ProcessReq(BaseModel):
 def _startup():
     global nlp
     try:
-        if DATABASE_URL:
-            db_init()
         nlp = spacy.load("en_core_web_sm")
     except Exception as e:
         raise RuntimeError(f"startup failed: {e}")
@@ -271,7 +171,14 @@ def build_words_block(slots: int, filled: Dict[int, str]) -> str:
     return "\\N".join(out)
 
 def write_ass(path: str, duration: float, slots: int, events_words: List[Dict], primary_hex: str):
-    primary = "&H0000FFFF"
+    if not re.fullmatch(r"[0-9A-Fa-f]{6}", (primary_hex or "")):
+        primary_hex = "FFFF00"
+
+    # ASS expects BBGGRR, you pass RRGGBB
+    rr = primary_hex[0:2]
+    gg = primary_hex[2:4]
+    bb = primary_hex[4:6]
+    primary = f"&H00{bb}{gg}{rr}"
 
     header = f"""[Script Info]
 ScriptType: v4.00+
@@ -296,8 +203,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     word_lines = []
     for ev in events_words:
-        start = clamp_time(ev["start"], 0.0, duration)
-        end = clamp_time(ev["end"], 0.0, duration)
+        start = clamp_time(float(ev["start"]), 0.0, duration)
+        end = clamp_time(float(ev["end"]), 0.0, duration)
         if end <= start:
             continue
         txt = ev["text"]
@@ -313,80 +220,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             f.write(line)
 
 
-# -------------------- AUTH --------------------
-
-def require_admin_key(x_api_key: Optional[str]):
-    if not ADMIN_API_KEY:
-        raise HTTPException(status_code=500, detail="ADMIN_API_KEY missing")
-    if (x_api_key or "").strip() != ADMIN_API_KEY:
-        raise HTTPException(status_code=401, detail="bad api key")
-
-
 # -------------------- ROUTES --------------------
 
 @app.get("/health")
 def health():
-    return {"ok": True}
-
-@app.get("/credits")
-def credits(email: str):
-    if not DATABASE_URL:
-        raise HTTPException(status_code=500, detail="DATABASE_URL missing")
-    return {"email": email, "credits": get_credits(email)}
-
-@app.post("/create-checkout-session")
-def create_checkout_session(req: CreateCheckoutReq, x_api_key: Optional[str] = Header(default=None)):
-    require_admin_key(x_api_key)
-
-    if not STRIPE_SECRET_KEY:
-        raise HTTPException(status_code=500, detail="STRIPE_SECRET_KEY missing")
-    if not SUCCESS_URL or not CANCEL_URL:
-        raise HTTPException(status_code=500, detail="SUCCESS_URL or CANCEL_URL missing")
-    if req.credits_pack != "10":
-        raise HTTPException(status_code=400, detail="only 10 supported")
-    if not PRICE_ID_10_CREDITS:
-        raise HTTPException(status_code=500, detail="PRICE_ID_10_CREDITS missing")
-
-    ensure_user(req.email)
-
-    session = stripe.checkout.Session.create(
-        mode="payment",
-        customer_email=req.email,
-        line_items=[{"price": PRICE_ID_10_CREDITS, "quantity": 1}],
-        success_url=SUCCESS_URL,
-        cancel_url=CANCEL_URL,
-        metadata={"email": req.email, "credits": "10"},
-    )
-    return {"checkout_url": session.url}
-
-@app.post("/webhook")
-async def webhook(request: Request):
-    if not STRIPE_WEBHOOK_SECRET:
-        raise HTTPException(status_code=500, detail="STRIPE_WEBHOOK_SECRET missing")
-
-    payload = await request.body()
-    sig = request.headers.get("stripe-signature", "")
-
-    try:
-        event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"bad webhook: {e}")
-
-    if not mark_event_once(event["id"]):
-        return {"ok": True}
-
-    if event["type"] == "checkout.session.completed":
-        obj = event["data"]["object"]
-        email = (obj.get("customer_email") or obj.get("metadata", {}).get("email") or "").strip()
-        credits_str = (obj.get("metadata", {}) or {}).get("credits", "0")
-        try:
-            credits_delta = int(credits_str)
-        except Exception:
-            credits_delta = 0
-
-        if email and credits_delta > 0:
-            add_credits(email, credits_delta)
-
     return {"ok": True}
 
 @app.post("/process")
@@ -395,8 +232,6 @@ def process(req: ProcessReq):
 
     if nlp is None:
         raise HTTPException(status_code=500, detail="spaCy not loaded")
-    if not DATABASE_URL:
-        raise HTTPException(status_code=500, detail="DATABASE_URL missing")
 
     slots = int(req.slots)
     if slots < 1:
@@ -404,18 +239,9 @@ def process(req: ProcessReq):
     if slots > 10:
         raise HTTPException(status_code=400, detail="slots too high, max 10")
 
-    email = (req.email or "").strip().lower()
-    if not email:
-        raise HTTPException(status_code=400, detail="email missing")
-
-    ok = try_consume_credits(email, CREDITS_PER_PROCESS)
-    if not ok:
-        raise HTTPException(status_code=402, detail="no credits")
-
     work = f"/tmp/work_{uuid.uuid4().hex}"
     os.makedirs(work, exist_ok=True)
 
-    out_path = ""
     try:
         in_path = os.path.join(work, "input.mp4")
         download_file(req.video_url, in_path)
@@ -488,10 +314,7 @@ def process(req: ProcessReq):
                 filled[item["slot"]] = item["word"]
 
                 start = item["time"]
-                if i < len(overlay) - 1:
-                    end = overlay[i + 1]["time"]
-                else:
-                    end = duration
+                end = overlay[i + 1]["time"] if i < len(overlay) - 1 else duration
 
                 if end - start < min_chunk:
                     end = min(duration, start + min_chunk)
@@ -568,12 +391,10 @@ def process(req: ProcessReq):
         cleanup = BackgroundTask(shutil.rmtree, work, ignore_errors=True)
         return FileResponse(out_path, media_type="video/mp4", filename=os.path.basename(out_path), background=cleanup)
 
-    except HTTPException as e:
-        add_credits(email, CREDITS_PER_PROCESS)
+    except HTTPException:
         shutil.rmtree(work, ignore_errors=True)
-        raise e
+        raise
     except Exception as e:
-        add_credits(email, CREDITS_PER_PROCESS)
         shutil.rmtree(work, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"server error: {e}")
 
