@@ -24,7 +24,7 @@ from typing import Optional, List, Dict
 import whisper
 import spacy
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
@@ -57,6 +57,24 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Log requests so you can see what Rork hits in Railway logs
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    print(f"REQ {request.method} {request.url.path}")
+    resp = await call_next(request)
+    print(f"RES {request.method} {request.url.path} {resp.status_code}")
+    return resp
+
+# Preflight for browsers. Some clients call /api/process, some call /process
+@app.options("/process")
+def options_process():
+    return Response(status_code=204)
+
+@app.options("/api/process")
+def options_api_process():
+    return Response(status_code=204)
+
 
 nlp = None
 _whisper_model = None
@@ -100,10 +118,7 @@ def download_file(url: str, dest_path: str):
         raise HTTPException(status_code=400, detail="video_url missing")
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
     try:
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req) as resp:
             status = getattr(resp, "status", 200)
             if status != 200:
@@ -146,8 +161,7 @@ def strip_ass_tags(s: str) -> str:
 
 
 def esc_ass_text(s: str) -> str:
-    s = (s or "").replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
-    return s
+    return (s or "").replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
 
 
 def clamp_time(t: float, lo: float, hi: float) -> float:
@@ -260,6 +274,7 @@ def process(req: ProcessReq):
     work = f"/tmp/work_{uuid.uuid4().hex}"
     os.makedirs(work, exist_ok=True)
 
+    out_path = ""
     try:
         in_path = os.path.join(work, "input.mp4")
         download_file(req.video_url, in_path)
@@ -316,32 +331,21 @@ def process(req: ProcessReq):
 
             min_chunk = 0.60
             filled: Dict[int, str] = {}
-            events_words = []
+            events_words: List[Dict] = []
 
             first_time = overlay[0]["time"]
             if first_time < min_chunk:
                 first_time = min_chunk
 
-            events_words.append({
-                "start": 0.0,
-                "end": first_time,
-                "text": build_words_block(slots, filled)
-            })
+            events_words.append({"start": 0.0, "end": first_time, "text": build_words_block(slots, filled)})
 
             for i, item in enumerate(overlay):
                 filled[item["slot"]] = item["word"]
-
                 start = item["time"]
                 end = overlay[i + 1]["time"] if i < len(overlay) - 1 else duration
-
                 if end - start < min_chunk:
                     end = min(duration, start + min_chunk)
-
-                events_words.append({
-                    "start": start,
-                    "end": end,
-                    "text": build_words_block(slots, filled)
-                })
+                events_words.append({"start": start, "end": end, "text": build_words_block(slots, filled)})
 
             ass_path = os.path.join(work, "list.ass")
             write_ass(ass_path, duration, slots, events_words, req.sub_primary_hex)
@@ -417,7 +421,7 @@ def process(req: ProcessReq):
         raise HTTPException(status_code=500, detail=f"server error: {e}")
 
 
-# Rork calls /api/process, route alias
+# Rork calls /api/process. Keep this alias.
 @app.post("/api/process")
 def process_api(req: ProcessReq):
     return process(req)
