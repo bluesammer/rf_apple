@@ -24,7 +24,7 @@ from typing import Optional, List, Dict
 import whisper
 import spacy
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
@@ -54,11 +54,11 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Log requests so you can see what Rork hits in Railway logs
+# Log requests so you see what Rork hits in Railway logs
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     print(f"REQ {request.method} {request.url.path}")
@@ -73,6 +73,10 @@ def options_process():
 
 @app.options("/api/process")
 def options_api_process():
+    return Response(status_code=204)
+
+@app.options("/api/process_upload")
+def options_api_process_upload():
     return Response(status_code=204)
 
 
@@ -130,6 +134,16 @@ def download_file(url: str, dest_path: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"download failed: {e}")
+
+
+def save_upload(upload: UploadFile, dest_path: str):
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    with open(dest_path, "wb") as f:
+        while True:
+            chunk = upload.file.read(1024 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
 
 
 def get_duration_or_zero(path: str) -> float:
@@ -274,7 +288,6 @@ def process(req: ProcessReq):
     work = f"/tmp/work_{uuid.uuid4().hex}"
     os.makedirs(work, exist_ok=True)
 
-    out_path = ""
     try:
         in_path = os.path.join(work, "input.mp4")
         download_file(req.video_url, in_path)
@@ -425,6 +438,175 @@ def process(req: ProcessReq):
 @app.post("/api/process")
 def process_api(req: ProcessReq):
     return process(req)
+
+
+# Upload endpoint for Rork when it uploads a file from web preview
+@app.post("/api/process_upload")
+def process_upload(
+    file: UploadFile = File(...),
+    slots: int = Form(5),
+    target_fps: int = Form(30),
+    sub_primary_hex: str = Form("FFFF00"),
+    logo_enabled: bool = Form(True),
+    logo_url: Optional[str] = Form(None),
+    output_prefix: str = Form("ReelFive_"),
+):
+    ensure_tools()
+
+    if nlp is None:
+        raise HTTPException(status_code=500, detail="spaCy not loaded")
+
+    slots = int(slots)
+    if slots < 1:
+        raise HTTPException(status_code=400, detail="slots must be >= 1")
+    if slots > 10:
+        raise HTTPException(status_code=400, detail="slots too high, max 10")
+
+    work = f"/tmp/work_{uuid.uuid4().hex}"
+    os.makedirs(work, exist_ok=True)
+
+    try:
+        in_path = os.path.join(work, "input.mp4")
+        save_upload(file, in_path)
+
+        duration = get_duration_or_zero(in_path)
+        if duration <= 0:
+            raise HTTPException(status_code=400, detail="ffprobe duration failed")
+
+        model = get_whisper_model()
+
+        with PROCESS_LOCK:
+            with TRANSCRIBE_LOCK:
+                try:
+                    result = model.transcribe(in_path, word_timestamps=True, fp16=False)
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=f"whisper transcribe failed: {e}")
+
+            words: List[Dict] = []
+            for seg in result.get("segments", []):
+                for w in seg.get("words", []):
+                    token = (w.get("word") or "").strip()
+                    if token:
+                        words.append({"word": token, "start": float(w.get("start", 0) or 0)})
+
+            if len(words) == 0:
+                raise HTTPException(status_code=500, detail="no transcript words")
+
+            docs = list(nlp.pipe([w["word"] for w in words]))
+            for i, doc in enumerate(docs):
+                words[i]["pos"] = doc[0].pos_ if len(doc) else "X"
+
+            preferred = [w for w in words if w["pos"] in ("NOUN", "PROPN")]
+            seg_len = duration / max(slots, 1)
+
+            overlay = []
+            for i in range(slots):
+                seg_start = i * seg_len
+                seg_end = seg_start + seg_len
+                seg_words = [w for w in preferred if seg_start <= w["start"] < seg_end]
+                chosen = seg_words[0] if len(seg_words) > 0 else words[min(i, len(words) - 1)]
+
+                clean = normalize_word(chosen["word"]).upper()
+                final_word = clean if clean else (chosen["word"] or "").strip().upper()
+                final_word = strip_ass_tags(final_word)
+
+                t = float(chosen["start"])
+                t = clamp_time(t, 0.0, max(0.0, duration - 0.01))
+
+                overlay.append({"slot": i + 1, "word": final_word, "time": t})
+
+            overlay.sort(key=lambda x: x["time"])
+
+            min_chunk = 0.60
+            filled: Dict[int, str] = {}
+            events_words: List[Dict] = []
+
+            first_time = overlay[0]["time"]
+            if first_time < min_chunk:
+                first_time = min_chunk
+
+            events_words.append({"start": 0.0, "end": first_time, "text": build_words_block(slots, filled)})
+
+            for i, item in enumerate(overlay):
+                filled[item["slot"]] = item["word"]
+                start = item["time"]
+                end = overlay[i + 1]["time"] if i < len(overlay) - 1 else duration
+                if end - start < min_chunk:
+                    end = min(duration, start + min_chunk)
+                events_words.append({"start": start, "end": end, "text": build_words_block(slots, filled)})
+
+            ass_path = os.path.join(work, "list.ass")
+            write_ass(ass_path, duration, slots, events_words, sub_primary_hex)
+
+            use_logo = False
+            logo_path = os.path.join(work, "logo.png")
+            if bool(logo_enabled):
+                if logo_url:
+                    download_file(logo_url, logo_path)
+                    use_logo = os.path.exists(logo_path)
+                else:
+                    local_logo = "/app/logo.png"
+                    if os.path.exists(local_logo):
+                        shutil.copy(local_logo, logo_path)
+                        use_logo = os.path.exists(logo_path)
+
+            out_name = f"{output_prefix}{uuid.uuid4().hex}.mp4"
+            out_path = os.path.join(work, out_name)
+
+            ass_f = esc_ff_filter(ass_path)
+            logo_f = esc_ff_filter(logo_path)
+
+            sub_filter = f"subtitles='{ass_f}'"
+            fps_filter = f"fps={int(target_fps)}"
+
+            if use_logo:
+                vf = (
+                    f"[0:v]{fps_filter},{sub_filter}[v];"
+                    f"movie='{logo_f}',scale={LOGO_SCALE_W}:-1[logo];"
+                    f"[v][logo]overlay=W-w-{LOGO_PAD_X}:{LOGO_PAD_Y}:format=auto"
+                )
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-i", in_path,
+                    "-filter_complex", vf,
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-pix_fmt", "yuv420p",
+                    "-movflags", "+faststart",
+                    "-r", str(int(target_fps)),
+                    "-c:a", "aac", "-b:a", "128k",
+                    out_path
+                ]
+            else:
+                vf = f"{fps_filter},{sub_filter}"
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-i", in_path,
+                    "-vf", vf,
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-pix_fmt", "yuv420p",
+                    "-movflags", "+faststart",
+                    "-r", str(int(target_fps)),
+                    "-c:a", "aac", "-b:a", "128k",
+                    out_path
+                ]
+
+            p = subprocess.run(cmd, capture_output=True, text=True)
+            if p.returncode != 0:
+                tail = (p.stderr or "")[-2500:]
+                raise HTTPException(status_code=500, detail=f"ffmpeg failed: {tail}")
+
+            if not os.path.exists(out_path):
+                raise HTTPException(status_code=500, detail="output mp4 missing")
+
+        cleanup = BackgroundTask(shutil.rmtree, work, ignore_errors=True)
+        return FileResponse(out_path, media_type="video/mp4", filename=os.path.basename(out_path), background=cleanup)
+
+    except HTTPException:
+        shutil.rmtree(work, ignore_errors=True)
+        raise
+    except Exception as e:
+        shutil.rmtree(work, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"server error: {e}")
 
 
 # In[ ]:
