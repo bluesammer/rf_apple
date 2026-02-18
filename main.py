@@ -54,7 +54,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -66,7 +66,7 @@ async def log_requests(request: Request, call_next):
     print(f"RES {request.method} {request.url.path} {resp.status_code}")
     return resp
 
-# Preflight for browsers. Some clients call /api/process, some call /process
+# Preflight routes (browser OPTIONS)
 @app.options("/process")
 def options_process():
     return Response(status_code=204)
