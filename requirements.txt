@@ -1,0 +1,15 @@
+fastapi==0.110.0
+uvicorn[standard]==0.27.1
+
+numpy==1.26.4
+spacy==3.7.4
+tqdm==4.66.4
+regex==2024.11.6
+requests==2.32.3
+
+pydantic==2.6.4
+
+openai-whisper==20231117
+
+torch==2.1.2+cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
