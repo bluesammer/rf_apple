@@ -28,6 +28,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
+from fastapi.middleware.cors import CORSMiddleware
 
 
 # ---------- TUNING ----------
@@ -48,28 +49,30 @@ LOGO_PAD_Y = 30
 
 app = FastAPI()
 
+# CORS for Rork web preview and browser testing
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 nlp = None
 _whisper_model = None
 TRANSCRIBE_LOCK = threading.Lock()
 PROCESS_LOCK = threading.Lock()
 
 
-# -------------------- MODELS --------------------
-
 class ProcessReq(BaseModel):
     video_url: str = Field(..., description="Direct public or signed mp4/mov url")
-
     slots: int = 5
     target_fps: int = 30
     sub_primary_hex: str = "FFFF00"
-
     logo_enabled: bool = True
     logo_url: Optional[str] = None
-
     output_prefix: str = "ReelFive_"
 
-
-# -------------------- STARTUP --------------------
 
 @app.on_event("startup")
 def _startup():
@@ -87,18 +90,21 @@ def get_whisper_model():
     return _whisper_model
 
 
-# -------------------- HELPERS --------------------
-
 def ensure_tools():
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
         raise HTTPException(status_code=500, detail="ffmpeg or ffprobe missing")
+
 
 def download_file(url: str, dest_path: str):
     if not url:
         raise HTTPException(status_code=400, detail="video_url missing")
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
     try:
-        with urllib.request.urlopen(url) as resp:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        with urllib.request.urlopen(req) as resp:
             status = getattr(resp, "status", 200)
             if status != 200:
                 raise HTTPException(status_code=400, detail=f"download failed http {status}")
@@ -109,6 +115,7 @@ def download_file(url: str, dest_path: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"download failed: {e}")
+
 
 def get_duration_or_zero(path: str) -> float:
     r = subprocess.run(
@@ -126,18 +133,22 @@ def get_duration_or_zero(path: str) -> float:
     except Exception:
         return 0.0
 
+
 def normalize_word(w: str) -> str:
     w = (w or "").strip().lower()
     w = w.replace("’", "'")
     w = re.sub(r"[^a-z']", "", w)
     return w
 
+
 def strip_ass_tags(s: str) -> str:
     return re.sub(r"\{\\[^}]*\}", "", s or "").strip()
+
 
 def esc_ass_text(s: str) -> str:
     s = (s or "").replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
     return s
+
 
 def clamp_time(t: float, lo: float, hi: float) -> float:
     if t < lo:
@@ -145,6 +156,7 @@ def clamp_time(t: float, lo: float, hi: float) -> float:
     if t > hi:
         return hi
     return t
+
 
 def ass_time(t: float) -> str:
     if t < 0:
@@ -158,11 +170,14 @@ def ass_time(t: float) -> str:
     cs -= s * 100
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
+
 def esc_ff_filter(s: str) -> str:
     return s.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
 
+
 def build_numbers_block(slots: int) -> str:
     return "\\N".join([f"{i}." for i in range(1, slots + 1)])
+
 
 def build_words_block(slots: int, filled: Dict[int, str]) -> str:
     out = []
@@ -170,11 +185,11 @@ def build_words_block(slots: int, filled: Dict[int, str]) -> str:
         out.append(esc_ass_text(filled.get(i, "")))
     return "\\N".join(out)
 
+
 def write_ass(path: str, duration: float, slots: int, events_words: List[Dict], primary_hex: str):
     if not re.fullmatch(r"[0-9A-Fa-f]{6}", (primary_hex or "")):
         primary_hex = "FFFF00"
 
-    # ASS expects BBGGRR, you pass RRGGBB
     rr = primary_hex[0:2]
     gg = primary_hex[2:4]
     bb = primary_hex[4:6]
@@ -220,11 +235,14 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             f.write(line)
 
 
-# -------------------- ROUTES --------------------
-
 @app.get("/health")
 def health():
     return {"ok": True}
+
+@app.get("/api/health")
+def health_api():
+    return {"ok": True}
+
 
 @app.post("/process")
 def process(req: ProcessReq):
@@ -397,6 +415,12 @@ def process(req: ProcessReq):
     except Exception as e:
         shutil.rmtree(work, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"server error: {e}")
+
+
+# Rork calls /api/process, route alias
+@app.post("/api/process")
+def process_api(req: ProcessReq):
+    return process(req)
 
 
 # In[ ]:
