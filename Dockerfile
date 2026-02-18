@@ -26,8 +26,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 RUN pip install --no-cache-dir --no-build-isolation openai-whisper==20231117
 
-RUN pip install --no-cache-dir \
-  https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.4/en_core_web_sm-3.7.4-py3-none-any.whl
+RUN python -m spacy download en_core_web_sm
 
 COPY . .
 
