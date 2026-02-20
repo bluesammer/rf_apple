@@ -20,12 +20,13 @@ import urllib.request
 import uuid
 import threading
 from typing import Optional, List, Dict
+from pathlib import Path
 
 import whisper
 import spacy
 
 from fastapi import FastAPI, HTTPException, Request, Response, UploadFile, File, Form
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 from fastapi.middleware.cors import CORSMiddleware
@@ -47,9 +48,9 @@ LOGO_PAD_X = 30
 LOGO_PAD_Y = 30
 # --------------------------
 
+
 app = FastAPI()
 
-# CORS for Rork web preview and browser testing
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -58,7 +59,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Log requests so you see what Rork hits in Railway logs
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     print(f"REQ {request.method} {request.url.path}")
@@ -66,7 +66,7 @@ async def log_requests(request: Request, call_next):
     print(f"RES {request.method} {request.url.path} {resp.status_code}")
     return resp
 
-# Preflight routes (browser OPTIONS)
+
 @app.options("/process")
 def options_process():
     return Response(status_code=204)
@@ -79,11 +79,18 @@ def options_api_process():
 def options_api_process_upload():
     return Response(status_code=204)
 
+@app.options("/api/output/{name}")
+def options_api_output(name: str):
+    return Response(status_code=204)
+
 
 nlp = None
 _whisper_model = None
 TRANSCRIBE_LOCK = threading.Lock()
 PROCESS_LOCK = threading.Lock()
+
+OUTPUT_DIR = "/tmp/outputs"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 class ProcessReq(BaseModel):
@@ -263,6 +270,14 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             f.write(line)
 
 
+def persist_output(out_path: str) -> str:
+    out_base = os.path.basename(out_path)
+    persist_name = f"{uuid.uuid4().hex}_{out_base}"
+    persist_path = os.path.join(OUTPUT_DIR, persist_name)
+    shutil.copyfile(out_path, persist_path)
+    return persist_name
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -270,6 +285,18 @@ def health():
 @app.get("/api/health")
 def health_api():
     return {"ok": True}
+
+
+@app.get("/api/output/{name}")
+def get_output(name: str):
+    if "/" in name or ".." in name:
+        raise HTTPException(status_code=400, detail="bad name")
+
+    path = os.path.join(OUTPUT_DIR, name)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="missing")
+
+    return FileResponse(path, media_type="video/mp4", filename=name)
 
 
 @app.post("/process")
@@ -423,8 +450,17 @@ def process(req: ProcessReq):
             if not os.path.exists(out_path):
                 raise HTTPException(status_code=500, detail="output mp4 missing")
 
+            persist_name = persist_output(out_path)
+
         cleanup = BackgroundTask(shutil.rmtree, work, ignore_errors=True)
-        return FileResponse(out_path, media_type="video/mp4", filename=os.path.basename(out_path), background=cleanup)
+        return JSONResponse(
+            {
+                "ok": True,
+                "output_name": persist_name,
+                "output_url": f"/api/output/{persist_name}",
+            },
+            background=cleanup,
+        )
 
     except HTTPException:
         shutil.rmtree(work, ignore_errors=True)
@@ -434,13 +470,11 @@ def process(req: ProcessReq):
         raise HTTPException(status_code=500, detail=f"server error: {e}")
 
 
-# Rork calls /api/process. Keep this alias.
 @app.post("/api/process")
 def process_api(req: ProcessReq):
     return process(req)
 
 
-# Upload endpoint for Rork when it uploads a file from web preview
 @app.post("/api/process_upload")
 def process_upload(
     file: UploadFile = File(...),
@@ -466,6 +500,8 @@ def process_upload(
     os.makedirs(work, exist_ok=True)
 
     try:
+        print("UPLOAD START", file.filename)
+
         in_path = os.path.join(work, "input.mp4")
         save_upload(file, in_path)
 
@@ -598,8 +634,17 @@ def process_upload(
             if not os.path.exists(out_path):
                 raise HTTPException(status_code=500, detail="output mp4 missing")
 
+            persist_name = persist_output(out_path)
+
         cleanup = BackgroundTask(shutil.rmtree, work, ignore_errors=True)
-        return FileResponse(out_path, media_type="video/mp4", filename=os.path.basename(out_path), background=cleanup)
+        return JSONResponse(
+            {
+                "ok": True,
+                "output_name": persist_name,
+                "output_url": f"/api/output/{persist_name}",
+            },
+            background=cleanup,
+        )
 
     except HTTPException:
         shutil.rmtree(work, ignore_errors=True)
