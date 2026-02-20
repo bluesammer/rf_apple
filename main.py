@@ -13,6 +13,7 @@
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
+import time
 import shutil
 import subprocess
 import re
@@ -20,7 +21,6 @@ import urllib.request
 import uuid
 import threading
 from typing import Optional, List, Dict
-from pathlib import Path
 
 import whisper
 import spacy
@@ -43,6 +43,13 @@ WORD_X = 250
 FONT_SIZE = 45
 OUTLINE = 5
 
+# speed defaults
+DEFAULT_FPS = 24
+SCALE_W = 720
+FFMPEG_PRESET = "ultrafast"
+FFMPEG_CRF = "28"
+
+# logo
 LOGO_SCALE_W = 160
 LOGO_PAD_X = 30
 LOGO_PAD_Y = 30
@@ -96,9 +103,9 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 class ProcessReq(BaseModel):
     video_url: str = Field(..., description="Direct public or signed mp4/mov url")
     slots: int = 5
-    target_fps: int = 30
+    target_fps: int = DEFAULT_FPS
     sub_primary_hex: str = "FFFF00"
-    logo_enabled: bool = True
+    logo_enabled: bool = False
     logo_url: Optional[str] = None
     output_prefix: str = "ReelFive_"
 
@@ -112,10 +119,16 @@ def _startup():
         raise RuntimeError(f"startup failed: {e}")
 
 
+def tlog(label: str, t0: float):
+    dt = time.time() - t0
+    print(f"STAGE {label} {dt:.2f}s")
+
+
 def get_whisper_model():
     global _whisper_model
     if _whisper_model is None:
-        _whisper_model = whisper.load_model("base")
+        # speed-first model
+        _whisper_model = whisper.load_model("tiny")
     return _whisper_model
 
 
@@ -168,13 +181,6 @@ def get_duration_or_zero(path: str) -> float:
         return float(out)
     except Exception:
         return 0.0
-
-
-def normalize_word(w: str) -> str:
-    w = (w or "").strip().lower()
-    w = w.replace("’", "'")
-    w = re.sub(r"[^a-z']", "", w)
-    return w
 
 
 def strip_ass_tags(s: str) -> str:
@@ -278,6 +284,168 @@ def persist_output(out_path: str) -> str:
     return persist_name
 
 
+def pick_keywords(full_text: str, slots: int) -> List[str]:
+    if nlp is None:
+        return [""] * slots
+
+    doc = nlp(full_text)
+    picked: List[str] = []
+    seen = set()
+
+    for tok in doc:
+        if tok.pos_ in ("NOUN", "PROPN") and tok.is_alpha:
+            w = tok.text.strip().upper()
+            w = strip_ass_tags(w)
+            if not w:
+                continue
+            if w in seen:
+                continue
+            seen.add(w)
+            picked.append(w)
+            if len(picked) >= slots:
+                break
+
+    while len(picked) < slots:
+        picked.append("")
+
+    return picked[:slots]
+
+
+def build_progressive_events(duration: float, slots: int, words: List[str]) -> List[Dict]:
+    min_chunk = 0.8
+    seg_len = max(duration / max(slots, 1), min_chunk)
+
+    # reveal each slot at evenly spaced times
+    reveal_times = []
+    for i in range(slots):
+        t = i * seg_len
+        t = clamp_time(t, 0.0, max(0.0, duration - 0.01))
+        reveal_times.append(t)
+
+    events: List[Dict] = []
+    filled: Dict[int, str] = {}
+
+    # first event from 0 to first reveal
+    first_end = reveal_times[0] if reveal_times else duration
+    first_end = max(first_end, min_chunk)
+    first_end = clamp_time(first_end, 0.0, duration)
+    events.append({"start": 0.0, "end": first_end, "text": build_words_block(slots, filled)})
+
+    for i in range(slots):
+        filled[i + 1] = words[i]
+        start = reveal_times[i]
+        end = reveal_times[i + 1] if i < slots - 1 else duration
+        end = max(end, start + min_chunk)
+        end = clamp_time(end, 0.0, duration)
+        events.append({"start": start, "end": end, "text": build_words_block(slots, filled)})
+
+    return events
+
+
+def render_video(in_path: str, duration: float, slots: int, target_fps: int, sub_primary_hex: str,
+                 logo_enabled: bool, logo_url: Optional[str], output_prefix: str) -> (str, str):
+    t0 = time.time()
+
+    model = get_whisper_model()
+
+    t_wh = time.time()
+    print("STAGE whisper start")
+    # speed-first: no word timestamps
+    result = model.transcribe(in_path, word_timestamps=False, fp16=False)
+    tlog("whisper done", t_wh)
+
+    full_text = (result.get("text") or "").strip()
+    print("STAGE transcript_chars", len(full_text))
+
+    if not full_text:
+        raise HTTPException(status_code=500, detail="empty transcript text")
+
+    t_sp = time.time()
+    words = pick_keywords(full_text, slots)
+    tlog("spacy pick done", t_sp)
+    print("STAGE picked", words)
+
+    events_words = build_progressive_events(duration, slots, words)
+
+    ass_path = os.path.join(os.path.dirname(in_path), "list.ass")
+    write_ass(ass_path, duration, slots, events_words, sub_primary_hex)
+
+    use_logo = False
+    logo_path = os.path.join(os.path.dirname(in_path), "logo.png")
+    if logo_enabled:
+        if logo_url:
+            download_file(logo_url, logo_path)
+            use_logo = os.path.exists(logo_path)
+        else:
+            local_logo = "/app/logo.png"
+            if os.path.exists(local_logo):
+                shutil.copy(local_logo, logo_path)
+                use_logo = os.path.exists(logo_path)
+
+    out_name = f"{output_prefix}{uuid.uuid4().hex}.mp4"
+    out_path = os.path.join(os.path.dirname(in_path), out_name)
+
+    ass_f = esc_ff_filter(ass_path)
+    logo_f = esc_ff_filter(logo_path)
+
+    fps = int(target_fps) if int(target_fps) > 0 else DEFAULT_FPS
+    fps_filter = f"fps={fps}"
+    sub_filter = f"subtitles='{ass_f}'"
+
+    # speed: scale down
+    scale_filter = f"scale={SCALE_W}:-2"
+
+    t_ff = time.time()
+    print("STAGE ffmpeg start")
+
+    if use_logo:
+        vf = (
+            f"[0:v]{scale_filter},{fps_filter},{sub_filter}[v];"
+            f"movie='{logo_f}',scale={LOGO_SCALE_W}:-1[logo];"
+            f"[v][logo]overlay=W-w-{LOGO_PAD_X}:{LOGO_PAD_Y}:format=auto"
+        )
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", in_path,
+            "-filter_complex", vf,
+            "-c:v", "libx264", "-preset", FFMPEG_PRESET, "-crf", FFMPEG_CRF,
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            "-r", str(fps),
+            "-c:a", "aac", "-b:a", "128k",
+            out_path
+        ]
+    else:
+        vf = f"{scale_filter},{fps_filter},{sub_filter}"
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", in_path,
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", FFMPEG_PRESET, "-crf", FFMPEG_CRF,
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            "-r", str(fps),
+            "-c:a", "aac", "-b:a", "128k",
+            out_path
+        ]
+
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        tail = (p.stderr or "")[-2500:]
+        raise HTTPException(status_code=500, detail=f"ffmpeg failed: {tail}")
+
+    tlog("ffmpeg done", t_ff)
+
+    if not os.path.exists(out_path):
+        raise HTTPException(status_code=500, detail="output mp4 missing")
+
+    print("STAGE out_bytes", os.path.getsize(out_path))
+    tlog("render total", t0)
+
+    persist_name = persist_output(out_path)
+    return persist_name, out_path
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -302,7 +470,6 @@ def get_output(name: str):
 @app.post("/process")
 def process(req: ProcessReq):
     ensure_tools()
-
     if nlp is None:
         raise HTTPException(status_code=500, detail="spaCy not loaded")
 
@@ -312,145 +479,42 @@ def process(req: ProcessReq):
     if slots > 10:
         raise HTTPException(status_code=400, detail="slots too high, max 10")
 
+    t0_all = time.time()
+
     work = f"/tmp/work_{uuid.uuid4().hex}"
     os.makedirs(work, exist_ok=True)
 
     try:
         in_path = os.path.join(work, "input.mp4")
-        download_file(req.video_url, in_path)
-        if not os.path.exists(in_path):
-            raise HTTPException(status_code=400, detail="video download failed")
 
+        t_dl = time.time()
+        download_file(req.video_url, in_path)
+        tlog("download", t_dl)
+
+        print("STAGE input_bytes", os.path.getsize(in_path))
+
+        t_pr = time.time()
         duration = get_duration_or_zero(in_path)
+        tlog("ffprobe", t_pr)
+
         if duration <= 0:
             raise HTTPException(status_code=400, detail="ffprobe duration failed")
 
-        model = get_whisper_model()
-
         with PROCESS_LOCK:
             with TRANSCRIBE_LOCK:
-                try:
-                    result = model.transcribe(in_path, word_timestamps=True, fp16=False)
-                except Exception as e:
-                    raise HTTPException(status_code=500, detail=f"whisper transcribe failed: {e}")
-
-            words: List[Dict] = []
-            for seg in result.get("segments", []):
-                for w in seg.get("words", []):
-                    token = (w.get("word") or "").strip()
-                    if token:
-                        words.append({"word": token, "start": float(w.get("start", 0) or 0)})
-
-            if len(words) == 0:
-                raise HTTPException(status_code=500, detail="no transcript words")
-
-            docs = list(nlp.pipe([w["word"] for w in words]))
-            for i, doc in enumerate(docs):
-                words[i]["pos"] = doc[0].pos_ if len(doc) else "X"
-
-            preferred = [w for w in words if w["pos"] in ("NOUN", "PROPN")]
-            seg_len = duration / max(slots, 1)
-
-            overlay = []
-            for i in range(slots):
-                seg_start = i * seg_len
-                seg_end = seg_start + seg_len
-                seg_words = [w for w in preferred if seg_start <= w["start"] < seg_end]
-                chosen = seg_words[0] if len(seg_words) > 0 else words[min(i, len(words) - 1)]
-
-                clean = normalize_word(chosen["word"]).upper()
-                final_word = clean if clean else (chosen["word"] or "").strip().upper()
-                final_word = strip_ass_tags(final_word)
-
-                t = float(chosen["start"])
-                t = clamp_time(t, 0.0, max(0.0, duration - 0.01))
-
-                overlay.append({"slot": i + 1, "word": final_word, "time": t})
-
-            overlay.sort(key=lambda x: x["time"])
-
-            min_chunk = 0.60
-            filled: Dict[int, str] = {}
-            events_words: List[Dict] = []
-
-            first_time = overlay[0]["time"]
-            if first_time < min_chunk:
-                first_time = min_chunk
-
-            events_words.append({"start": 0.0, "end": first_time, "text": build_words_block(slots, filled)})
-
-            for i, item in enumerate(overlay):
-                filled[item["slot"]] = item["word"]
-                start = item["time"]
-                end = overlay[i + 1]["time"] if i < len(overlay) - 1 else duration
-                if end - start < min_chunk:
-                    end = min(duration, start + min_chunk)
-                events_words.append({"start": start, "end": end, "text": build_words_block(slots, filled)})
-
-            ass_path = os.path.join(work, "list.ass")
-            write_ass(ass_path, duration, slots, events_words, req.sub_primary_hex)
-
-            use_logo = False
-            logo_path = os.path.join(work, "logo.png")
-            if req.logo_enabled:
-                if req.logo_url:
-                    download_file(req.logo_url, logo_path)
-                    use_logo = os.path.exists(logo_path)
-                else:
-                    local_logo = "/app/logo.png"
-                    if os.path.exists(local_logo):
-                        shutil.copy(local_logo, logo_path)
-                        use_logo = os.path.exists(logo_path)
-
-            out_name = f"{req.output_prefix}{uuid.uuid4().hex}.mp4"
-            out_path = os.path.join(work, out_name)
-
-            ass_f = esc_ff_filter(ass_path)
-            logo_f = esc_ff_filter(logo_path)
-
-            sub_filter = f"subtitles='{ass_f}'"
-            fps_filter = f"fps={int(req.target_fps)}"
-
-            if use_logo:
-                vf = (
-                    f"[0:v]{fps_filter},{sub_filter}[v];"
-                    f"movie='{logo_f}',scale={LOGO_SCALE_W}:-1[logo];"
-                    f"[v][logo]overlay=W-w-{LOGO_PAD_X}:{LOGO_PAD_Y}:format=auto"
+                persist_name, _ = render_video(
+                    in_path=in_path,
+                    duration=duration,
+                    slots=slots,
+                    target_fps=int(req.target_fps),
+                    sub_primary_hex=req.sub_primary_hex,
+                    logo_enabled=bool(req.logo_enabled),
+                    logo_url=req.logo_url,
+                    output_prefix=req.output_prefix,
                 )
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-i", in_path,
-                    "-filter_complex", vf,
-                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                    "-pix_fmt", "yuv420p",
-                    "-movflags", "+faststart",
-                    "-r", str(int(req.target_fps)),
-                    "-c:a", "aac", "-b:a", "128k",
-                    out_path
-                ]
-            else:
-                vf = f"{fps_filter},{sub_filter}"
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-i", in_path,
-                    "-vf", vf,
-                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                    "-pix_fmt", "yuv420p",
-                    "-movflags", "+faststart",
-                    "-r", str(int(req.target_fps)),
-                    "-c:a", "aac", "-b:a", "128k",
-                    out_path
-                ]
 
-            p = subprocess.run(cmd, capture_output=True, text=True)
-            if p.returncode != 0:
-                tail = (p.stderr or "")[-2500:]
-                raise HTTPException(status_code=500, detail=f"ffmpeg failed: {tail}")
-
-            if not os.path.exists(out_path):
-                raise HTTPException(status_code=500, detail="output mp4 missing")
-
-            persist_name = persist_output(out_path)
+        print("STAGE output_name", persist_name)
+        tlog("total", t0_all)
 
         cleanup = BackgroundTask(shutil.rmtree, work, ignore_errors=True)
         return JSONResponse(
@@ -479,14 +543,13 @@ def process_api(req: ProcessReq):
 def process_upload(
     file: UploadFile = File(...),
     slots: int = Form(5),
-    target_fps: int = Form(30),
+    target_fps: int = Form(DEFAULT_FPS),
     sub_primary_hex: str = Form("FFFF00"),
-    logo_enabled: bool = Form(True),
+    logo_enabled: bool = Form(False),
     logo_url: Optional[str] = Form(None),
     output_prefix: str = Form("ReelFive_"),
 ):
     ensure_tools()
-
     if nlp is None:
         raise HTTPException(status_code=500, detail="spaCy not loaded")
 
@@ -496,145 +559,43 @@ def process_upload(
     if slots > 10:
         raise HTTPException(status_code=400, detail="slots too high, max 10")
 
+    t0_all = time.time()
+
     work = f"/tmp/work_{uuid.uuid4().hex}"
     os.makedirs(work, exist_ok=True)
 
     try:
-        print("UPLOAD START", file.filename)
+        print("STAGE upload_start", file.filename)
 
+        t_up = time.time()
         in_path = os.path.join(work, "input.mp4")
         save_upload(file, in_path)
+        tlog("upload_write", t_up)
 
+        print("STAGE input_bytes", os.path.getsize(in_path))
+
+        t_pr = time.time()
         duration = get_duration_or_zero(in_path)
+        tlog("ffprobe", t_pr)
+
         if duration <= 0:
             raise HTTPException(status_code=400, detail="ffprobe duration failed")
 
-        model = get_whisper_model()
-
         with PROCESS_LOCK:
             with TRANSCRIBE_LOCK:
-                try:
-                    result = model.transcribe(in_path, word_timestamps=True, fp16=False)
-                except Exception as e:
-                    raise HTTPException(status_code=500, detail=f"whisper transcribe failed: {e}")
-
-            words: List[Dict] = []
-            for seg in result.get("segments", []):
-                for w in seg.get("words", []):
-                    token = (w.get("word") or "").strip()
-                    if token:
-                        words.append({"word": token, "start": float(w.get("start", 0) or 0)})
-
-            if len(words) == 0:
-                raise HTTPException(status_code=500, detail="no transcript words")
-
-            docs = list(nlp.pipe([w["word"] for w in words]))
-            for i, doc in enumerate(docs):
-                words[i]["pos"] = doc[0].pos_ if len(doc) else "X"
-
-            preferred = [w for w in words if w["pos"] in ("NOUN", "PROPN")]
-            seg_len = duration / max(slots, 1)
-
-            overlay = []
-            for i in range(slots):
-                seg_start = i * seg_len
-                seg_end = seg_start + seg_len
-                seg_words = [w for w in preferred if seg_start <= w["start"] < seg_end]
-                chosen = seg_words[0] if len(seg_words) > 0 else words[min(i, len(words) - 1)]
-
-                clean = normalize_word(chosen["word"]).upper()
-                final_word = clean if clean else (chosen["word"] or "").strip().upper()
-                final_word = strip_ass_tags(final_word)
-
-                t = float(chosen["start"])
-                t = clamp_time(t, 0.0, max(0.0, duration - 0.01))
-
-                overlay.append({"slot": i + 1, "word": final_word, "time": t})
-
-            overlay.sort(key=lambda x: x["time"])
-
-            min_chunk = 0.60
-            filled: Dict[int, str] = {}
-            events_words: List[Dict] = []
-
-            first_time = overlay[0]["time"]
-            if first_time < min_chunk:
-                first_time = min_chunk
-
-            events_words.append({"start": 0.0, "end": first_time, "text": build_words_block(slots, filled)})
-
-            for i, item in enumerate(overlay):
-                filled[item["slot"]] = item["word"]
-                start = item["time"]
-                end = overlay[i + 1]["time"] if i < len(overlay) - 1 else duration
-                if end - start < min_chunk:
-                    end = min(duration, start + min_chunk)
-                events_words.append({"start": start, "end": end, "text": build_words_block(slots, filled)})
-
-            ass_path = os.path.join(work, "list.ass")
-            write_ass(ass_path, duration, slots, events_words, sub_primary_hex)
-
-            use_logo = False
-            logo_path = os.path.join(work, "logo.png")
-            if bool(logo_enabled):
-                if logo_url:
-                    download_file(logo_url, logo_path)
-                    use_logo = os.path.exists(logo_path)
-                else:
-                    local_logo = "/app/logo.png"
-                    if os.path.exists(local_logo):
-                        shutil.copy(local_logo, logo_path)
-                        use_logo = os.path.exists(logo_path)
-
-            out_name = f"{output_prefix}{uuid.uuid4().hex}.mp4"
-            out_path = os.path.join(work, out_name)
-
-            ass_f = esc_ff_filter(ass_path)
-            logo_f = esc_ff_filter(logo_path)
-
-            sub_filter = f"subtitles='{ass_f}'"
-            fps_filter = f"fps={int(target_fps)}"
-
-            if use_logo:
-                vf = (
-                    f"[0:v]{fps_filter},{sub_filter}[v];"
-                    f"movie='{logo_f}',scale={LOGO_SCALE_W}:-1[logo];"
-                    f"[v][logo]overlay=W-w-{LOGO_PAD_X}:{LOGO_PAD_Y}:format=auto"
+                persist_name, _ = render_video(
+                    in_path=in_path,
+                    duration=duration,
+                    slots=slots,
+                    target_fps=int(target_fps),
+                    sub_primary_hex=sub_primary_hex,
+                    logo_enabled=bool(logo_enabled),
+                    logo_url=logo_url,
+                    output_prefix=output_prefix,
                 )
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-i", in_path,
-                    "-filter_complex", vf,
-                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                    "-pix_fmt", "yuv420p",
-                    "-movflags", "+faststart",
-                    "-r", str(int(target_fps)),
-                    "-c:a", "aac", "-b:a", "128k",
-                    out_path
-                ]
-            else:
-                vf = f"{fps_filter},{sub_filter}"
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-i", in_path,
-                    "-vf", vf,
-                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                    "-pix_fmt", "yuv420p",
-                    "-movflags", "+faststart",
-                    "-r", str(int(target_fps)),
-                    "-c:a", "aac", "-b:a", "128k",
-                    out_path
-                ]
 
-            p = subprocess.run(cmd, capture_output=True, text=True)
-            if p.returncode != 0:
-                tail = (p.stderr or "")[-2500:]
-                raise HTTPException(status_code=500, detail=f"ffmpeg failed: {tail}")
-
-            if not os.path.exists(out_path):
-                raise HTTPException(status_code=500, detail="output mp4 missing")
-
-            persist_name = persist_output(out_path)
+        print("STAGE output_name", persist_name)
+        tlog("total", t0_all)
 
         cleanup = BackgroundTask(shutil.rmtree, work, ignore_errors=True)
         return JSONResponse(
